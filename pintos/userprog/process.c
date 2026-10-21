@@ -17,7 +17,9 @@
 #include "threads/thread.h"
 #include "threads/mmu.h"
 #include "threads/vaddr.h"
+#include "threads/malloc.h"
 #include "intrinsic.h"
+#include "userprog/syscall.h"
 #ifdef VM
 #include "vm/vm.h"
 #endif
@@ -42,6 +44,8 @@ tid_t
 process_create_initd (const char *file_name) {
 	char *fn_copy;
 	tid_t tid;
+	char parse_buffer [128];	 /*	명령행 파싱을 위한 문자열 복사 버퍼, 커널의 명령행 최대길이 128 바이트 */
+	char *token, *save_ptr; 	 /* 문자열 파싱에 필요한 변수 */
 
 	/* Make a copy of FILE_NAME.
 	 * Otherwise there's a race between the caller and load(). */
@@ -50,23 +54,68 @@ process_create_initd (const char *file_name) {
 		return TID_ERROR;
 	strlcpy (fn_copy, file_name, PGSIZE);
 
+	struct child_state* state = malloc(sizeof (struct child_state));
+	if(state == NULL)
+	{
+		palloc_free_page(fn_copy);
+		return TID_ERROR;
+	}
+	state->exit_val = -1;
+	state->refer_cnt = 2;
+	lock_init(&state->refer_cnt_protect_lock);
+	sema_init(&state->wait_sema, 0);
+	state->waited = false;
+	
+	struct user_prog_initd_aux* aux = malloc(sizeof(struct user_prog_initd_aux));
+	if(aux == NULL)
+	{
+		free(state);
+		palloc_free_page(fn_copy);
+		return TID_ERROR;
+	}
+	aux->fn_copy = fn_copy;
+	aux->state = state;
+	
+	/* parse_buffer에 복사해서 첫 토큰 자르기. */
+	strlcpy (parse_buffer, file_name, sizeof (parse_buffer));
+	token = strtok_r (parse_buffer, " ", &save_ptr);
 	/* Create a new thread to execute FILE_NAME. */
-	tid = thread_create (file_name, PRI_DEFAULT, initd, fn_copy);
+	tid = thread_create (token, PRI_DEFAULT, initd, aux);
 	if (tid == TID_ERROR)
-		palloc_free_page (fn_copy);
+	{
+		free(state);
+		free(aux);
+		palloc_free_page(fn_copy);
+		return TID_ERROR;
+	}
+
+	state->tid = tid;
+	
+	struct thread* curr = thread_current();
+	list_init(&curr->child_state_list);
+	
+	list_push_back(&curr->child_state_list, &state->elem);
 	return tid;
 }
 
 /* A thread function that launches first user process. */
 static void
-initd (void *f_name) {
+initd (void *initd_aux) {
 #ifdef VM
 	supplemental_page_table_init (&thread_current ()->spt);
 #endif
 
 	process_init ();
+	
+	struct user_prog_initd_aux* aux = (struct user_prog_initd_aux*)initd_aux;
 
-	if (process_exec (f_name) < 0)
+	struct thread* curr = thread_current();
+	curr->share_parent = aux->state;
+
+	char* fn_copy = aux->fn_copy;
+	free(aux);
+	
+	if (process_exec (fn_copy) < 0)
 		PANIC("Fail to launch initd\n");
 	NOT_REACHED ();
 }
@@ -204,6 +253,38 @@ process_wait (tid_t child_tid UNUSED) {
 	/* XXX: Hint) The pintos exit if process_wait (initd), we recommend you
 	 * XXX:       to add infinite loop here before
 	 * XXX:       implementing the process_wait. */
+	struct thread* curr = thread_current();
+	if(child_tid == -1 || list_empty(&curr->child_state_list))
+		return -1;
+
+	for(struct list_elem* child = list_begin(&curr->child_state_list); child != list_end(&curr->child_state_list); child = list_next(child))
+	{
+		struct child_state* state = list_entry(child, struct child_state, elem);
+		if(state->tid != child_tid)
+			continue;
+		if(state->waited)
+			return -1;
+
+		state->waited = true;
+		sema_down(&state->wait_sema);
+
+		// remove를 먼저하는 이유: child_elem이 state에 있기 때문에 state를 해제하기 전 리스트에서 빼주기!
+		// sema_down 후 remove해도 되는 이유: 자식이 state를 삭제한 상태일 수 없기 때문에
+		list_remove(child);
+
+		lock_acquire(&state->refer_cnt_protect_lock);
+		int temp_exit_val = state->exit_val;
+		state->refer_cnt--;
+		if(state->refer_cnt == 0)
+		{
+			lock_release(&state->refer_cnt_protect_lock);
+			free(state);
+		}
+		else
+			lock_release(&state->refer_cnt_protect_lock);
+
+		return temp_exit_val;
+	}
 	return -1;
 }
 
@@ -216,7 +297,70 @@ process_exit (void) {
 	 * TODO: project2/process_termination.html).
 	 * TODO: We recommend you to implement process resource cleanup here. */
 
+	bool is_user_prog = curr->share_parent != NULL ? true : false;
+
+	if(is_user_prog)
+	{
+		printf ("%s: exit(%d)\n", curr->name, curr->share_parent->exit_val);
+	}
+	
+	// 자원 정리
+	if(is_user_prog)
+	{
+		// 나도 누군가(들)의 부모일 수 있다. 부모가 해제되기 때문에 자식들의 참조를 줄여야한다.
+		size_t size = list_size(&curr->child_state_list);
+		for(int i = 0; i < size; ++i)
+		{
+			struct list_elem* child = list_front(&curr->child_state_list);
+			struct child_state* state = list_entry(child, struct child_state, elem);
+
+			list_remove(child);
+
+			lock_acquire(&state->refer_cnt_protect_lock);
+			state->refer_cnt--;
+			if(state->refer_cnt == 0)
+			{
+				lock_release(&state->refer_cnt_protect_lock);
+				free(state);
+			}
+			else
+				lock_release(&state->refer_cnt_protect_lock);
+		}
+		if(!list_empty(&curr->file_list))
+		{	
+			size = list_size(&curr->file_list);
+			for(int i = 0; i < size; ++i)
+			{
+				struct list_elem* fd_elem = list_front(&curr->file_list);
+				struct fd_status* status = list_entry(fd_elem, struct fd_status, elem);
+				
+				lock_acquire(&file_lock);
+				file_close(status->file);
+				lock_release(&file_lock);
+				list_remove(fd_elem);
+				free(status);
+			}
+		}
+	}
 	process_cleanup ();
+
+	if(is_user_prog)
+	{
+		// 부모 호출(like 스몰더)
+		sema_up(&curr->share_parent->wait_sema); // 마지막에 up하는 이유: 맨 위에 했을 땐 부모가 먼저 깨어나서 wait에서 반환할 수 있기 때문이다.(제대로 정리되지 않고 반환)
+		// 부모가 먼저 깨어나도 아직 자식 참조는 있기에 share_parent가 해제되지 않음.
+
+		lock_acquire(&curr->share_parent->refer_cnt_protect_lock);
+		curr->share_parent->refer_cnt--;
+		if(curr->share_parent->refer_cnt == 0)
+		{
+			lock_release(&curr->share_parent->refer_cnt_protect_lock);
+			free(curr->share_parent);
+			// 락 해제하고 free해도 되는 이유: 참조자가 없기 때문에 값이 변경될 일도 없다!
+		}
+		else
+			lock_release(&curr->share_parent->refer_cnt_protect_lock);
+	}
 }
 
 /* Free the current process's resources. */
@@ -316,6 +460,22 @@ static bool load_segment (struct file *file, off_t ofs, uint8_t *upage,
 		uint32_t read_bytes, uint32_t zero_bytes,
 		bool writable);
 
+/* 스택 공간 검증 함수 */
+static bool
+is_stack_space_available (uintptr_t cur_rsp, uint64_t required_size) {
+	uint64_t rest_stack;
+	/* 	
+		현재 cur_rsp가 스택 하한 이상인지 확인
+	*/
+	if (cur_rsp < (USER_STACK - PGSIZE))
+		return false;
+	rest_stack = cur_rsp - (USER_STACK - PGSIZE);
+	return rest_stack >= required_size;
+}
+
+/* 스택 포인터 정렬 단위 */
+#define STACK_ALIGNMENT 16
+
 /* Loads an ELF executable from FILE_NAME into the current thread.
  * Stores the executable's entry point into *RIP
  * and its initial stack pointer into *RSP.
@@ -329,20 +489,35 @@ load (const char *file_name, struct intr_frame *if_) {
 	bool success = false;
 	int i;
 
+	int argc = 0; 				 /* 유저프로그램에 전달할 명령행 인자의 개수 */
+	char *arg_addrs [64];		 /* 유저 스택 안의 적재된 문자열의 포인터를 담는 임시버퍼 (포인터 64개)*/
+	char *token, *save_ptr; 	 /* 문자열 파싱에 필요한 변수 */
+	char parse_buffer [128];	 /*	명령행 파싱을 위한 문자열 복사 버퍼, 커널의 명령행 최대길이 128 바이트 */
+
 	/* Allocate and activate page directory. */
 	t->pml4 = pml4_create ();
 	if (t->pml4 == NULL)
 		goto done;
 	process_activate (thread_current ());
 
+	/* file_name 유효 검증 */
+	if (file_name == NULL)
+		goto done;
+
+	/* parse_buffer에 복사해서 첫 토큰 자르기. */
+	strlcpy (parse_buffer, file_name, sizeof (parse_buffer));
+	token = strtok_r (parse_buffer, " ", &save_ptr);
+	
 	/* Open executable file. */
-	file = filesys_open (file_name);
+	// 
+	file = filesys_open (token);
 	if (file == NULL) {
 		printf ("load: %s: open failed\n", file_name);
 		goto done;
 	}
 
 	/* Read and verify executable header. */
+	// lock
 	if (file_read (file, &ehdr, sizeof ehdr) != sizeof ehdr
 			|| memcmp (ehdr.e_ident, "\177ELF\2\1\1", 7)
 			|| ehdr.e_type != 2
@@ -359,10 +534,12 @@ load (const char *file_name, struct intr_frame *if_) {
 	for (i = 0; i < ehdr.e_phnum; i++) {
 		struct Phdr phdr;
 
+		// lock 
 		if (file_ofs < 0 || file_ofs > file_length (file))
 			goto done;
 		file_seek (file, file_ofs);
 
+		// lock
 		if (file_read (file, &phdr, sizeof phdr) != sizeof phdr)
 			goto done;
 		file_ofs += sizeof phdr;
@@ -417,11 +594,61 @@ load (const char *file_name, struct intr_frame *if_) {
 	/* TODO: Your code goes here.
 	 * TODO: Implement argument passing (see project2/argument_passing.html). */
 
+	size_t token_size;
+
+	/* 문자열 파싱 이어서 진행. */
+	for (; token != NULL; token = strtok_r (NULL, " ", &save_ptr)) {
+		token_size = strlen (token) + 1;
+		if (!(is_stack_space_available (if_->rsp, token_size) && argc < sizeof (arg_addrs) / sizeof (arg_addrs[0])))
+			goto done;
+		if_->rsp -= token_size;
+		strlcpy ((char *) if_->rsp, token, token_size);
+		arg_addrs [argc] = (char *) if_->rsp;
+		argc++;
+	}
+
+	/* 최종 rsp % 16 == 8 (함수 진입 직후 상태) 가 되도록 패딩을 구한다.
+	   가짜 반환 주소 8B 와 진입 오프셋 8B 는 상쇄되므로 argv 포인터 argc + 1 개만 센다. */
+	uintptr_t padding = (if_->rsp - (sizeof (void *) * (argc + 1))) % STACK_ALIGNMENT;
+
+	/* 스택 페이지는 setup_stack 에서 palloc_get_page (PAL_USER | PAL_ZERO) 로 받아
+	   이미 0 으로 채워져 있으므로, 패딩 자리를 따로 채우지 않는다. */
+	if (!is_stack_space_available (if_->rsp, padding))
+		goto done;
+	if_->rsp -= padding;
+	
+	/* 명령행 인자 목록의 끝을 나타내는 null 포인터 추가. */
+	if (!(argc < sizeof (arg_addrs) / sizeof (arg_addrs [0]))) 
+		goto done;
+	arg_addrs [argc] = NULL;
+
+	/* arg_addrs를 유저스택에 넣는 반복문 실행. */
+	for (i = argc; i >= 0; i--){
+		if (!is_stack_space_available (if_->rsp, sizeof (arg_addrs [0])))
+			goto done;
+		if_->rsp -= sizeof (arg_addrs [i]);
+		*(char **) if_->rsp = arg_addrs [i];
+
+		/* rsi가 argv 배열의 시작 주소(&argv[0])를 가리킴 */
+		if (i == 0) {
+			if_->R.rsi = if_->rsp;
+		}
+	}
+	
+	/* 가짜 반환 주소 넣고, 해당 주소에 8바이트의 '0'을 저장한다. */
+	if_->rsp -= sizeof (void *);
+	*(uint64_t *) if_->rsp = 0;
+
+	/* 레지스터 설정. */
+	if_->R.rdi = argc;
+	
 	success = true;
 
 done:
 	/* We arrive here whether the load is successful or not. */
+	lock_acquire(&file_lock);
 	file_close (file);
+	lock_release(&file_lock);
 	return success;
 }
 
