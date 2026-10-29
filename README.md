@@ -1,4 +1,4 @@
-# ThreeJ 팀 Pintos
+# 팀 Pintos
 
 ## 🤝 팀 작업 규칙
 
@@ -21,7 +21,7 @@ feature-기능-이름  →  feature-기능  →  dev  →  main
 | 팀원 초대 | ✅ |
 | 머지 후 브랜치 자동 삭제 해제 (기능 브랜치 유지) | ✅ |
 | TIL 날짜 폴더 (`docs/2026-10-09` ~ `2026-10-15`) | ✅ |
-| Project 1: threads | ⏳ 시작 전 |
+
 
 ---
 
